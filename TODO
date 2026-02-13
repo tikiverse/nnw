@@ -1,0 +1,1 @@
+- Add --feed-all x.com to use all feeds that match that pattern (here we can have ambigious selector, all matching feeds get used)

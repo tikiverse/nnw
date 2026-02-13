@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+Query NetNewsWire data for LLM summarization.
+
+Basic Usage:
+    nnw                    # Recent unread articles (default: last 7 days)
+    nnw --all              # All articles (last 7 days)
+    nnw --starred          # Starred articles only
+    nnw --days 3           # Articles from last 3 days
+    nnw --feeds            # List all feeds
+    nnw --feed "name"       # Articles from feed matching name (fuzzy)
+    nnw --feed "url"        # Articles from specific feed (exact URL)
+    nnw -a URL             # Lookup a single article by URL
+    nnw --limit 50         # Limit number of articles
+    nnw --format json      # Output as JSON instead of markdown
+    nnw --full             # Include full article content (no truncation)
+
+LLM Integration:
+    # Generate a prompt for summarization
+    nnw --days 1 --format markdown --prompt "Summarize these articles"
+
+    # Pipe directly to Claude CLI
+    nnw --days 1 --format markdown --prompt "Summarize each article in 2 sentences" | claude
+
+    # Copy to clipboard for pasting into a chat interface
+    nnw --days 1 --format markdown --prompt "What are the key themes?" | pbcopy
+"""
+
+import argparse
+import html
+import json
+import os
+import plistlib
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# NetNewsWire data paths
+NNW_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac"
+DB_PATH = NNW_CONTAINER / "DB.sqlite3"
+FEED_METADATA_PATH = NNW_CONTAINER / "FeedMetadata.plist"
+
+
+def strip_html(text: str) -> str:
+    """Remove HTML tags and decode entities."""
+    if not text:
+        return ''
+    # Remove HTML tags
+    clean = re.sub(r'<[^>]+>', ' ', text)
+    # Decode HTML entities
+    clean = html.unescape(clean)
+    # Normalize whitespace
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean
+
+
+def load_feed_metadata() -> dict:
+    """Load feed metadata from plist file."""
+    if not FEED_METADATA_PATH.exists():
+        return {}
+
+    with open(FEED_METADATA_PATH, 'rb') as f:
+        return plistlib.load(f)
+
+
+def get_feed_name(feed_id: str, metadata: dict) -> str:
+    """Get human-readable feed name from metadata."""
+    feed_info = metadata.get(feed_id, {})
+    # Prefer edited name, fall back to feed ID
+    return feed_info.get('editedName') or feed_info.get('homePageURL') or feed_id
+
+
+def query_feeds(metadata: dict) -> list:
+    """Get list of all feeds with metadata."""
+    feeds = []
+    for feed_id, info in metadata.items():
+        feeds.append({
+            'feed_url': feed_id,
+            'name': info.get('editedName') or info.get('homePageURL') or feed_id,
+            'home_page': info.get('homePageURL'),
+            'last_check': str(info.get('lastCheckDate', ''))
+        })
+    return sorted(feeds, key=lambda x: x['name'].lower())
+
+
+def resolve_feed_filter(search_term: str, metadata: dict) -> str:
+    """Resolve a --feed argument to a feed URL.
+
+    Args:
+        search_term: Either an exact feed URL or a substring to match against feed names
+        metadata: Feed metadata dictionary
+
+    Returns:
+        The matching feed URL
+
+    Raises:
+        SystemExit: If no match found or multiple matches (ambiguous)
+    """
+    # First, check for exact URL match
+    if search_term in metadata:
+        return search_term
+
+    # Otherwise, do case-insensitive substring match on feed names
+    matches = []
+    search_lower = search_term.lower()
+
+    for feed_url, info in metadata.items():
+        name = info.get('editedName') or info.get('homePageURL') or feed_url
+        if search_lower in name.lower():
+            matches.append({'name': name, 'feed_url': feed_url})
+
+    if len(matches) == 0:
+        # No matches - show available feeds
+        feeds = query_feeds(metadata)
+        feed_names = [f"  {f['name']}" for f in feeds]
+        print(f'No feed matched: "{search_term}"', file=sys.stderr)
+        print("Available feeds:", file=sys.stderr)
+        print('\n'.join(feed_names), file=sys.stderr)
+        sys.exit(1)
+
+    if len(matches) == 1:
+        return matches[0]['feed_url']
+
+    # Multiple matches - ambiguous
+    print(f'Ambiguous feed: "{search_term}"', file=sys.stderr)
+    print("Multiple feeds matched:", file=sys.stderr)
+    for m in sorted(matches, key=lambda x: x['name'].lower()):
+        print(f"  {m['name']}: {m['feed_url']}", file=sys.stderr)
+    sys.exit(1)
+
+
+def query_articles(
+    conn: sqlite3.Connection,
+    metadata: dict,
+    unread_only: bool = True,
+    starred_only: bool = False,
+    days: int = 7,
+    feed_urls: list = None,
+    limit: int = 100,
+    full_content: bool = False,
+    oldest_first: bool = False
+) -> list:
+    """Query articles from the database."""
+
+    # Calculate date threshold
+    threshold = datetime.now() - timedelta(days=days)
+    threshold_ts = threshold.timestamp()
+
+    # Build query
+    query = """
+        SELECT
+            a.articleID,
+            a.feedID,
+            a.title,
+            a.url,
+            a.externalURL,
+            a.summary,
+            a.contentText,
+            a.contentHTML,
+            a.datePublished,
+            s.read,
+            s.starred,
+            s.dateArrived
+        FROM articles a
+        LEFT JOIN statuses s ON a.articleID = s.articleID
+        WHERE a.datePublished > ?
+    """
+    params = [threshold_ts]
+
+    if unread_only and not starred_only:
+        query += " AND (s.read IS NULL OR s.read = 0)"
+
+    if starred_only:
+        query += " AND s.starred = 1"
+
+    if feed_urls:
+        placeholders = ', '.join('?' * len(feed_urls))
+        query += f" AND a.feedID IN ({placeholders})"
+        params.extend(feed_urls)
+
+    order = "ASC" if oldest_first else "DESC"
+    query += f" ORDER BY a.datePublished {order}"
+
+    if limit:
+        query += f" LIMIT {limit}"
+
+    cursor = conn.execute(query, params)
+
+    articles = []
+    for row in cursor.fetchall():
+        article_id, feed_id, title, url, external_url, summary, content_text, content_html, date_published, read, starred, date_arrived = row
+
+        # Convert timestamp to readable date
+        if date_published:
+            try:
+                pub_date = datetime.fromtimestamp(date_published).strftime('%Y-%m-%d %H:%M')
+            except:
+                pub_date = str(date_published)
+        else:
+            pub_date = None
+
+        # Get content - prefer text, then strip HTML
+        content = content_text or strip_html(content_html) or summary or ''
+        if full_content:
+            content_preview = content
+        else:
+            content_preview = content[:500] + '...' if len(content) > 500 else content
+
+        articles.append({
+            'feed': get_feed_name(feed_id, metadata),
+            'feed_url': feed_id,
+            'title': title or '(no title)',
+            'url': url or external_url,
+            'published': pub_date,
+            'read': bool(read),
+            'starred': bool(starred),
+            'summary': content_preview
+        })
+
+    return articles
+
+
+def query_article_by_url(
+    conn: sqlite3.Connection,
+    metadata: dict,
+    article_url: str,
+    full_content: bool = False
+) -> dict | None:
+    """Query a single article by its URL (checks both url and externalURL columns)."""
+    query = """
+        SELECT
+            a.articleID,
+            a.feedID,
+            a.title,
+            a.url,
+            a.externalURL,
+            a.summary,
+            a.contentText,
+            a.contentHTML,
+            a.datePublished,
+            s.read,
+            s.starred,
+            s.dateArrived
+        FROM articles a
+        LEFT JOIN statuses s ON a.articleID = s.articleID
+        WHERE a.url = ? OR a.externalURL = ?
+    """
+    cursor = conn.execute(query, [article_url, article_url])
+    row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    article_id, feed_id, title, url, external_url, summary, content_text, content_html, date_published, read, starred, date_arrived = row
+
+    # Convert timestamp to readable date
+    if date_published:
+        try:
+            pub_date = datetime.fromtimestamp(date_published).strftime('%Y-%m-%d %H:%M')
+        except:
+            pub_date = str(date_published)
+    else:
+        pub_date = None
+
+    # Get content - prefer text, then strip HTML
+    content = content_text or strip_html(content_html) or summary or ''
+    if full_content:
+        content_preview = content
+    else:
+        content_preview = content[:500] + '...' if len(content) > 500 else content
+
+    return {
+        'feed': get_feed_name(feed_id, metadata),
+        'feed_url': feed_id,
+        'title': title or '(no title)',
+        'url': url or external_url,
+        'published': pub_date,
+        'read': bool(read),
+        'starred': bool(starred),
+        'summary': content_preview
+    }
+
+
+def format_as_markdown(data: dict) -> str:
+    """Format output as markdown for easier reading."""
+    lines = []
+
+    if 'feeds' in data:
+        lines.append("# NetNewsWire Feeds\n")
+        for feed in data['feeds']:
+            lines.append(f"- **{feed['name']}**")
+            lines.append(f"  - URL: {feed['feed_url']}")
+            if feed['home_page']:
+                lines.append(f"  - Home: {feed['home_page']}")
+            lines.append("")
+
+    if 'articles' in data:
+        lines.append(f"# Articles ({data['count']} total)\n")
+        for article in data['articles']:
+            starred = "⭐ " if article['starred'] else ""
+            read_status = "" if article['read'] else "📬 "
+            lines.append(f"## {starred}{read_status}{article['title']}")
+            lines.append(f"**Feed:** {article['feed']}")
+            lines.append(f"**Published:** {article['published']}")
+            if article['url']:
+                lines.append(f"**Link:** {article['url']}")
+            if article['summary']:
+                lines.append(f"\n{article['summary']}")
+            lines.append("\n---\n")
+
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Query NetNewsWire data for LLM summarization')
+    parser.add_argument('-a', '--article', type=str, metavar='URL', help='Lookup a single article by URL')
+    parser.add_argument('--feeds', action='store_true', help='List all feeds')
+    parser.add_argument('--all', action='store_true', help='Include read articles')
+    parser.add_argument('--starred', action='store_true', help='Only starred articles')
+    parser.add_argument('--days', type=int, default=7, help='Number of days to look back (default: 7)')
+    parser.add_argument('-f', '--feed', type=str, action='append', metavar='NAME_OR_URL',
+                        help='Filter by feed (fuzzy name match or exact URL). Can be used multiple times.')
+    parser.add_argument('--limit', type=int, default=100, help='Max articles to return (default: 100)')
+    parser.add_argument('--format', choices=['json', 'markdown', 'md'], default='markdown', help='Output format (default: markdown)')
+    parser.add_argument('--full', action='store_true', help='Include full article content (no truncation)')
+    parser.add_argument('--oldest-first', action='store_true', help='Sort oldest articles first (default: newest first)')
+    parser.add_argument('--prompt', type=str, metavar='INSTRUCTION', help='Wrap output with LLM prompt (e.g., "Summarize these articles")')
+
+    args = parser.parse_args()
+
+    # Check if database exists
+    if not DB_PATH.exists():
+        print(json.dumps({'error': f'NetNewsWire database not found at {DB_PATH}'}))
+        return 1
+
+    # Load feed metadata
+    metadata = load_feed_metadata()
+
+    if args.feeds:
+        # List feeds mode
+        feeds = query_feeds(metadata)
+        output = {'feeds': feeds, 'count': len(feeds)}
+    elif args.article:
+        # Single article lookup mode
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            article = query_article_by_url(conn, metadata, args.article, full_content=args.full)
+            if not article:
+                print(f'Article not found: {args.article}', file=sys.stderr)
+                return 1
+            output = {'articles': [article], 'count': 1}
+        finally:
+            conn.close()
+    else:
+        # Resolve feed filters to URLs
+        resolved_feeds = None
+        feed_info = None
+        if args.feed:
+            resolved_feeds = []
+            feed_info = []
+            for search_term in args.feed:
+                feed_url = resolve_feed_filter(search_term, metadata)
+                resolved_feeds.append(feed_url)
+                feed_name = get_feed_name(feed_url, metadata)
+                feed_info.append({'name': feed_name, 'url': feed_url})
+
+        # Query articles mode
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            articles = query_articles(
+                conn,
+                metadata,
+                unread_only=not args.all,
+                starred_only=args.starred,
+                days=args.days,
+                feed_urls=resolved_feeds,
+                limit=args.limit,
+                full_content=args.full,
+                oldest_first=args.oldest_first
+            )
+            output = {
+                'articles': articles,
+                'count': len(articles),
+                'query': {
+                    'unread_only': not args.all,
+                    'starred_only': args.starred,
+                    'days': args.days,
+                    'feeds': feed_info
+                }
+            }
+        finally:
+            conn.close()
+
+    # Format output
+    if args.format in ('markdown', 'md'):
+        formatted = format_as_markdown(output)
+    else:
+        formatted = json.dumps(output, indent=2, ensure_ascii=False)
+
+    # Wrap with prompt if requested
+    if args.prompt:
+        print(f"{args.prompt}\n\n<articles>\n{formatted}\n</articles>")
+    else:
+        print(formatted)
+
+    return 0
+
+
+if __name__ == '__main__':
+    exit(main())
