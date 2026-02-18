@@ -512,7 +512,7 @@ def main():
     parser.add_argument('--full', action='store_true', help='Include full article content (no truncation)')
     parser.add_argument('--truncate', action='store_true', help='Use truncated content (--prompt auto-enables --full; this reverts to 500 char limit)')
     parser.add_argument('--oldest-first', action='store_true', help='Sort oldest articles first (default: newest first)')
-    parser.add_argument('--prompt', type=str, metavar='INSTRUCTION', help='Wrap output with LLM prompt (e.g., "Summarize these articles")')
+    parser.add_argument('--prompt', type=str, metavar='TEXT', help='Prefix output with TEXT for LLM piping (enables --full)')
     parser.add_argument('-l', '--links', action='store_true', help='Enable clickable terminal hyperlinks (OSC 8)')
 
     args = parser.parse_args()

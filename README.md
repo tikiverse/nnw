@@ -48,7 +48,7 @@ Requires macOS with NetNewsWire using local "On My Mac" account.
 --all             include read articles
 --starred         starred only
 --full            full content (no truncation)
---prompt TEXT     wrap output for LLM
+--prompt TEXT     prefix output with TEXT for LLM piping (enables --full)
 --truncate        truncate content (if --prompt auto-enabled --full)
 --format          json | markdown | summary
 --limit N         max articles (default 100)
