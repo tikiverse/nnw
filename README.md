@@ -55,10 +55,14 @@ Requires macOS with NetNewsWire using local "On My Mac" account.
 -l, --links       clickable terminal links
 ```
 
-## config
+## config (optional)
 
-Paths configurable via env vars (highest priority) or `$XDG_CONFIG_HOME/nnw/config`:
+Works out of the box. Default container path:
+```
+~/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac
+```
 
+If/as needed, override via env vars (highest priority) or `$XDG_CONFIG_HOME/nnw/config`:
 ```
 NNW_CONTAINER=/path/to/OnMyMac
 NNW_DB_PATH=/path/to/DB.sqlite3
