@@ -41,11 +41,53 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-# NetNewsWire data paths
-NNW_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac"
-DB_PATH = NNW_CONTAINER / "DB.sqlite3"
-FEED_METADATA_PATH = NNW_CONTAINER / "FeedMetadata.plist"
-SUBSCRIPTIONS_PATH = NNW_CONTAINER / "Subscriptions.opml"
+# Default NetNewsWire data paths
+DEFAULT_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac"
+
+
+def load_config() -> dict:
+    """Load config from XDG_CONFIG_HOME/nnw/config if it exists."""
+    xdg_config = os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')
+    config_file = Path(xdg_config) / 'nnw' / 'config'
+    config = {}
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, val = line.split('=', 1)
+                config[key.strip()] = val.strip()
+    return config
+
+
+def get_paths() -> tuple:
+    """Get data paths with priority: env vars > XDG config > defaults."""
+    config = load_config()
+
+    container = Path(
+        os.environ.get('NNW_CONTAINER') or
+        config.get('NNW_CONTAINER') or
+        DEFAULT_CONTAINER
+    )
+
+    db_path = Path(
+        os.environ.get('NNW_DB_PATH') or
+        config.get('NNW_DB_PATH') or
+        container / "DB.sqlite3"
+    )
+
+    feed_metadata_path = Path(
+        os.environ.get('NNW_FEED_METADATA_PATH') or
+        config.get('NNW_FEED_METADATA_PATH') or
+        container / "FeedMetadata.plist"
+    )
+
+    subscriptions_path = Path(
+        os.environ.get('NNW_SUBSCRIPTIONS_PATH') or
+        config.get('NNW_SUBSCRIPTIONS_PATH') or
+        container / "Subscriptions.opml"
+    )
+
+    return db_path, feed_metadata_path, subscriptions_path
 
 
 def terminal_link(url: str, text: str) -> str:
@@ -66,27 +108,27 @@ def strip_html(text: str) -> str:
     return clean
 
 
-def load_feed_metadata() -> dict:
+def load_feed_metadata(path: Path) -> dict:
     """Load feed metadata from plist file."""
-    if not FEED_METADATA_PATH.exists():
+    if not path.exists():
         return {}
 
-    with open(FEED_METADATA_PATH, 'rb') as f:
+    with open(path, 'rb') as f:
         return plistlib.load(f)
 
 
-def load_feed_names_from_opml() -> dict:
+def load_feed_names_from_opml(path: Path) -> dict:
     """Load feed names from OPML subscriptions file.
 
     Returns:
         Dict mapping feed URL (xmlUrl) to feed title
     """
-    if not SUBSCRIPTIONS_PATH.exists():
+    if not path.exists():
         return {}
 
     feed_names = {}
     try:
-        tree = ET.parse(SUBSCRIPTIONS_PATH)
+        tree = ET.parse(path)
         root = tree.getroot()
 
         # Find all outline elements with xmlUrl (these are feeds)
@@ -486,14 +528,17 @@ def main():
     # --full explicitly enables, --prompt implicitly enables (unless --truncate overrides)
     full_content = args.full or (args.prompt and not args.truncate)
 
+    # Get configured paths
+    db_path, feed_metadata_path, subscriptions_path = get_paths()
+
     # Check if database exists
-    if not DB_PATH.exists():
-        print(json.dumps({'error': f'NetNewsWire database not found at {DB_PATH}'}))
+    if not db_path.exists():
+        print(json.dumps({'error': f'NetNewsWire database not found at {db_path}'}))
         return 1
 
     # Load feed metadata and OPML names
-    metadata = load_feed_metadata()
-    opml_names = load_feed_names_from_opml()
+    metadata = load_feed_metadata(feed_metadata_path)
+    opml_names = load_feed_names_from_opml(subscriptions_path)
 
     if args.feeds:
         # List feeds mode
@@ -501,7 +546,7 @@ def main():
         output = {'feeds': feeds, 'count': len(feeds)}
     elif args.article:
         # Single article lookup mode
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(db_path)
         try:
             article = query_article_by_url(conn, metadata, args.article, full_content=full_content, opml_names=opml_names)
             if not article:
@@ -536,7 +581,7 @@ def main():
                             feed_info.append({'name': feed_name, 'url': feed_url})
 
         # Query articles mode
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(db_path)
         try:
             articles = query_articles(
                 conn,

@@ -54,3 +54,14 @@ Requires macOS with NetNewsWire using local "On My Mac" account.
 --limit N         max articles (default 100)
 -l, --links       clickable terminal links
 ```
+
+## config
+
+Paths configurable via env vars (highest priority) or `$XDG_CONFIG_HOME/nnw/config`:
+
+```
+NNW_CONTAINER=/path/to/OnMyMac
+NNW_DB_PATH=/path/to/DB.sqlite3
+NNW_FEED_METADATA_PATH=/path/to/FeedMetadata.plist
+NNW_SUBSCRIPTIONS_PATH=/path/to/Subscriptions.opml
+```
