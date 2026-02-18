@@ -3,8 +3,9 @@
 Query NetNewsWire data for LLM summarization.
 
 Basic Usage:
-    nnw                    # Recent unread articles (default: last 1 day)
-    nnw --all              # All articles (last 7 days)
+    nnw                    # All unread articles
+    nnw -t                 # Today's unread articles (last 1 day)
+    nnw --all              # All articles (including read)
     nnw --starred          # Starred articles only
     nnw --days 3           # Articles from last 3 days
     nnw --feeds            # List all feeds
@@ -45,6 +46,11 @@ NNW_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Everg
 DB_PATH = NNW_CONTAINER / "DB.sqlite3"
 FEED_METADATA_PATH = NNW_CONTAINER / "FeedMetadata.plist"
 SUBSCRIPTIONS_PATH = NNW_CONTAINER / "Subscriptions.opml"
+
+
+def terminal_link(url: str, text: str) -> str:
+    """Wrap text in OSC 8 hyperlink escape sequence."""
+    return f'\033]8;;{url}\033\\{text}\033]8;;\033\\'
 
 
 def strip_html(text: str) -> str:
@@ -214,7 +220,7 @@ def query_articles(
     metadata: dict,
     unread_only: bool = True,
     starred_only: bool = False,
-    days: int = 7,
+    days: int = None,
     feed_urls: list = None,
     limit: int = 100,
     full_content: bool = False,
@@ -222,10 +228,6 @@ def query_articles(
     opml_names: dict = None
 ) -> list:
     """Query articles from the database."""
-
-    # Calculate date threshold
-    threshold = datetime.now() - timedelta(days=days)
-    threshold_ts = threshold.timestamp()
 
     # Build query
     query = """
@@ -244,9 +246,16 @@ def query_articles(
             s.dateArrived
         FROM articles a
         LEFT JOIN statuses s ON a.articleID = s.articleID
-        WHERE a.datePublished > ?
+        WHERE 1=1
     """
-    params = [threshold_ts]
+    params = []
+
+    # Add date filter if days specified
+    if days is not None:
+        threshold = datetime.now() - timedelta(days=days)
+        threshold_ts = threshold.timestamp()
+        query += " AND a.datePublished > ?"
+        params.append(threshold_ts)
 
     if unread_only and not starred_only:
         query += " AND (s.read IS NULL OR s.read = 0)"
@@ -363,7 +372,7 @@ def query_article_by_url(
     }
 
 
-def format_as_markdown(data: dict) -> str:
+def format_as_markdown(data: dict, use_links: bool = False) -> str:
     """Format output as markdown for easier reading."""
     lines = []
 
@@ -371,9 +380,15 @@ def format_as_markdown(data: dict) -> str:
         lines.append("# NetNewsWire Feeds\n")
         for feed in data['feeds']:
             lines.append(f"- **{feed['name']}**")
-            lines.append(f"  - URL: {feed['feed_url']}")
+            feed_url = feed['feed_url']
+            if use_links:
+                feed_url = terminal_link(feed_url, feed_url)
+            lines.append(f"  - URL: {feed_url}")
             if feed['home_page']:
-                lines.append(f"  - Home: {feed['home_page']}")
+                home_page = feed['home_page']
+                if use_links:
+                    home_page = terminal_link(home_page, home_page)
+                lines.append(f"  - Home: {home_page}")
             lines.append("")
 
     if 'articles' in data:
@@ -385,7 +400,10 @@ def format_as_markdown(data: dict) -> str:
             lines.append(f"**Feed:** {article['feed']}")
             lines.append(f"**Published:** {article['published']}")
             if article['url']:
-                lines.append(f"**Link:** {article['url']}")
+                url = article['url']
+                if use_links:
+                    url = terminal_link(url, url)
+                lines.append(f"**Link:** {url}")
             if article['summary']:
                 lines.append(f"\n{article['summary']}")
             lines.append("\n---\n")
@@ -393,7 +411,7 @@ def format_as_markdown(data: dict) -> str:
     return '\n'.join(lines)
 
 
-def format_as_summary(data: dict) -> str:
+def format_as_summary(data: dict, use_links: bool = False) -> str:
     """Format output as condensed summary grouped by feed."""
     lines = []
 
@@ -415,13 +433,19 @@ def format_as_summary(data: dict) -> str:
             feed_name = article['feed']
             if feed_name not in feeds:
                 feeds[feed_name] = []
-            feeds[feed_name].append(article['title'])
+            feeds[feed_name].append({'title': article['title'], 'url': article.get('url')})
 
         # Output grouped by feed
         for feed_name in sorted(feeds.keys(), key=str.lower):
-            titles = feeds[feed_name]
-            lines.append(f"{feed_name} ({len(titles)})")
-            for title in titles:
+            articles = feeds[feed_name]
+            lines.append(f"{feed_name} ({len(articles)})")
+            for article in articles:
+                # Normalize whitespace and truncate for summary view
+                title = re.sub(r'\s+', ' ', article['title']).strip()
+                if len(title) > 80:
+                    title = title[:79] + '…'
+                if use_links and article['url']:
+                    title = terminal_link(article['url'], title)
                 lines.append(f"- {title}")
             lines.append("")
 
@@ -434,7 +458,8 @@ def main():
     parser.add_argument('--feeds', action='store_true', help='List all feeds')
     parser.add_argument('--all', action='store_true', help='Include read articles')
     parser.add_argument('--starred', action='store_true', help='Only starred articles')
-    parser.add_argument('-d', '--days', type=int, default=1, help='Number of days to look back (default: 1)')
+    parser.add_argument('-d', '--days', type=int, default=None, help='Number of days to look back (default: all)')
+    parser.add_argument('-t', '--today', action='store_true', help='Articles from today only (shorthand for -d 1)')
     parser.add_argument('-f', '--feed', type=str, action='append', metavar='NAME_OR_URL',
                         help='Filter by feed (fuzzy name match or exact URL). Can be used multiple times.')
     parser.add_argument('-ff', '--feed-filter', type=str, action='append', metavar='PATTERN',
@@ -443,10 +468,23 @@ def main():
     parser.add_argument('-s', action='store_true', help='Condensed summary format (same as --format summary)')
     parser.add_argument('--format', choices=['json', 'markdown', 'md', 'summary'], default='markdown', help='Output format (default: markdown)')
     parser.add_argument('--full', action='store_true', help='Include full article content (no truncation)')
+    parser.add_argument('--truncate', action='store_true', help='Use truncated content (--prompt auto-enables --full; this reverts to 500 char limit)')
     parser.add_argument('--oldest-first', action='store_true', help='Sort oldest articles first (default: newest first)')
     parser.add_argument('--prompt', type=str, metavar='INSTRUCTION', help='Wrap output with LLM prompt (e.g., "Summarize these articles")')
+    parser.add_argument('-l', '--links', action='store_true', help='Enable clickable terminal hyperlinks (OSC 8)')
 
     args = parser.parse_args()
+
+    # Handle -t/--today shorthand
+    if args.today:
+        args.days = 1
+
+    # Enable links if flag set or NNW_LINKS=1 environment variable
+    use_links = args.links or os.environ.get('NNW_LINKS') == '1'
+
+    # Determine full_content mode:
+    # --full explicitly enables, --prompt implicitly enables (unless --truncate overrides)
+    full_content = args.full or (args.prompt and not args.truncate)
 
     # Check if database exists
     if not DB_PATH.exists():
@@ -465,7 +503,7 @@ def main():
         # Single article lookup mode
         conn = sqlite3.connect(DB_PATH)
         try:
-            article = query_article_by_url(conn, metadata, args.article, full_content=args.full, opml_names=opml_names)
+            article = query_article_by_url(conn, metadata, args.article, full_content=full_content, opml_names=opml_names)
             if not article:
                 print(f'Article not found: {args.article}', file=sys.stderr)
                 return 1
@@ -508,7 +546,7 @@ def main():
                 days=args.days,
                 feed_urls=resolved_feeds,
                 limit=args.limit,
-                full_content=args.full,
+                full_content=full_content,
                 oldest_first=args.oldest_first,
                 opml_names=opml_names
             )
@@ -531,9 +569,9 @@ def main():
 
     # Format output
     if args.format in ('markdown', 'md'):
-        formatted = format_as_markdown(output)
+        formatted = format_as_markdown(output, use_links=use_links)
     elif args.format == 'summary':
-        formatted = format_as_summary(output)
+        formatted = format_as_summary(output, use_links=use_links)
     else:
         formatted = json.dumps(output, indent=2, ensure_ascii=False)
 
