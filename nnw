@@ -42,7 +42,7 @@ from pathlib import Path
 
 
 # Default NetNewsWire data paths
-DEFAULT_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac"
+DEFAULT_CONTAINER = Path.home() / "Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/2_iCloud"
 
 
 def load_config() -> dict:
@@ -78,7 +78,7 @@ def get_paths() -> tuple:
     feed_metadata_path = Path(
         os.environ.get('NNW_FEED_METADATA_PATH') or
         config.get('NNW_FEED_METADATA_PATH') or
-        container / "FeedMetadata.plist"
+        container / "FeedSettings.db"
     )
 
     subscriptions_path = Path(
@@ -108,13 +108,37 @@ def strip_html(text: str) -> str:
     return clean
 
 
+APPLE_EPOCH_OFFSET = 978307200
+
+
 def load_feed_metadata(path: Path) -> dict:
-    """Load feed metadata from plist file."""
+    """Load feed metadata from FeedSettings.db (current) or FeedMetadata.plist (legacy)."""
     if not path.exists():
         return {}
 
-    with open(path, 'rb') as f:
-        return plistlib.load(f)
+    if path.suffix == '.plist':
+        with open(path, 'rb') as f:
+            return plistlib.load(f)
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT feedURL, feedID, homePageURL, editedName, lastCheckDate FROM feedSettings"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    metadata = {}
+    for feed_url, feed_id, home_page, edited_name, last_check in rows:
+        info = {}
+        if home_page:
+            info['homePageURL'] = home_page
+        if edited_name:
+            info['editedName'] = edited_name
+        if last_check:
+            info['lastCheckDate'] = datetime.fromtimestamp(last_check + APPLE_EPOCH_OFFSET)
+        metadata[feed_id or feed_url] = info
+    return metadata
 
 
 def load_feed_names_from_opml(path: Path) -> dict:
@@ -546,7 +570,7 @@ def main():
         output = {'feeds': feeds, 'count': len(feeds)}
     elif args.article:
         # Single article lookup mode
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             article = query_article_by_url(conn, metadata, args.article, full_content=full_content, opml_names=opml_names)
             if not article:
@@ -581,7 +605,7 @@ def main():
                             feed_info.append({'name': feed_name, 'url': feed_url})
 
         # Query articles mode
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             articles = query_articles(
                 conn,

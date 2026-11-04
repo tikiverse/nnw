@@ -57,15 +57,25 @@ Requires macOS with NetNewsWire using local "On My Mac" account.
 
 ## config (optional)
 
-Works out of the box. Default container path:
+Works out of the box for NetNewsWire's iCloud account. Default container path:
 ```
-~/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac
+~/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/2_iCloud
 ```
 
-If/as needed, override via env vars (highest priority) or `$XDG_CONFIG_HOME/nnw/config`:
+To use a different account, point `NNW_CONTAINER` at its folder in `~/.config/nnw/config`. Each account has its own folder under `Accounts/`, such as `OnMyMac` for local feeds:
 ```
-NNW_CONTAINER=/path/to/OnMyMac
+mkdir -p ~/.config/nnw
+echo "NNW_CONTAINER=$HOME/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application Support/NetNewsWire/Accounts/OnMyMac" > ~/.config/nnw/config
+```
+
+Run `ls ~/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Application\ Support/NetNewsWire/Accounts` to see which accounts you have.
+
+Settings can also be set as env vars, which take priority over the config file. You can override individual files too:
+```
+NNW_CONTAINER=/path/to/account/folder
 NNW_DB_PATH=/path/to/DB.sqlite3
-NNW_FEED_METADATA_PATH=/path/to/FeedMetadata.plist
+NNW_FEED_METADATA_PATH=/path/to/FeedSettings.db
 NNW_SUBSCRIPTIONS_PATH=/path/to/Subscriptions.opml
 ```
+
+`NNW_FEED_METADATA_PATH` also accepts a legacy `FeedMetadata.plist` from older NetNewsWire versions.
